@@ -1,7 +1,8 @@
 
 import os
 import io
-from typing import Optional
+import logging
+import time
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +13,7 @@ from docx import Document
 app = FastAPI(title="DocuAI API")
 
 # Temporary development configuration.
-# Restrict this to your actual CodePen origin before production.
+# Restrict this to your actual frontend origin before production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +25,7 @@ app.add_middleware(
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 def extract_text(filename: str, content: bytes) -> str:
@@ -33,20 +34,27 @@ def extract_text(filename: str, content: bytes) -> str:
     try:
         if name.endswith(".pdf"):
             reader = PdfReader(io.BytesIO(content))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
+            return "\n".join(
+                page.extract_text() or "" for page in reader.pages
+            )
 
         if name.endswith(".docx"):
             doc = Document(io.BytesIO(content))
             paragraphs = [p.text for p in doc.paragraphs]
+
             for table in doc.tables:
                 for row in table.rows:
-                    paragraphs.append(" | ".join(cell.text for cell in row.cells))
+                    paragraphs.append(
+                        " | ".join(cell.text for cell in row.cells)
+                    )
+
             return "\n".join(paragraphs)
 
         if name.endswith(".txt"):
             return content.decode("utf-8-sig", errors="replace")
 
     except Exception as exc:
+        logging.exception("Document extraction failed")
         raise HTTPException(
             status_code=400,
             detail=f"Could not read this document: {exc}",
@@ -58,23 +66,14 @@ def extract_text(filename: str, content: bytes) -> str:
     )
 
 
-
-
-
 def ask_gemini(prompt: str) -> str:
-    import logging
-    import time
-
     if not client:
         raise HTTPException(
             status_code=500,
             detail="Gemini API key is not configured on the server.",
         )
 
-    fallback_model = os.getenv(
-        "GEMINI_FALLBACK_MODEL",
-        "gemini-3.6-flash",
-    )
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
 
     models = [MODEL_NAME]
     if fallback_model and fallback_model not in models:
@@ -84,7 +83,6 @@ def ask_gemini(prompt: str) -> str:
 
     for model in models:
         try:
-            # Limit each request to 25 seconds.
             response = client.models.generate_content(
                 model=model,
                 contents=prompt,
@@ -94,7 +92,7 @@ def ask_gemini(prompt: str) -> str:
             if not response.text:
                 raise HTTPException(
                     status_code=502,
-                    detail="Gemini returned no text. Try another document.",
+                    detail="Gemini returned no text. Try again.",
                 )
 
             return response.text
@@ -113,8 +111,8 @@ def ask_gemini(prompt: str) -> str:
                 type(exc).__name__,
             )
 
-            # Try the fallback for temporary service errors.
-            if code not in (429, 500, 503, 504):
+            # Try another configured model for temporary errors.
+            if code not in (408, 429, 500, 502, 503, 504):
                 raise HTTPException(
                     status_code=502,
                     detail=(
@@ -123,20 +121,17 @@ def ask_gemini(prompt: str) -> str:
                     ),
                 )
 
-            # Brief pause before attempting the fallback.
             time.sleep(1)
 
-    logging.error("All Gemini models failed: %s", last_error)
+    logging.error("All configured Gemini models failed: %s", last_error)
 
     raise HTTPException(
         status_code=503,
         detail=(
             "Gemini is temporarily unavailable. "
-            "Please try again in a minute."
+            "Please try again shortly."
         ),
     )
-
-
 
 
 @app.get("/")
@@ -155,14 +150,20 @@ async def summarize(file: UploadFile = File(...)):
     content = await file.read()
 
     if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Maximum file size is 10 MB.")
+        raise HTTPException(
+            status_code=413,
+            detail="Maximum file size is 10 MB.",
+        )
 
     text = extract_text(filename, content).strip()
 
     if not text:
         raise HTTPException(
             status_code=400,
-            detail="No readable text found. Scanned PDFs need OCR, which is not included yet.",
+            detail=(
+                "No readable text found. Scanned PDFs need OCR, "
+                "which is not included yet."
+            ),
         )
 
     if len(text) > 100_000:
@@ -173,8 +174,10 @@ async def summarize(file: UploadFile = File(...)):
         "important points, and a conclusion. Do not invent facts.\n\n"
         f"DOCUMENT:\n{text}"
     )
-     return {
-          "filename": filename,
+
+    # Return both the summary and extracted text for frontend Q&A.
+    return {
+        "filename": filename,
         "summary": summary,
         "document_text": text,
     }
@@ -185,15 +188,28 @@ async def chat(
     question: str = Form(...),
     document_text: str = Form(...),
 ):
-    if not question.strip():
-        raise HTTPException(status_code=400, detail="Enter a question.")
+    question = question.strip()
+    document_text = document_text.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a question.",
+        )
+
+    if not document_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Document text is missing. Upload and summarize a document first.",
+        )
 
     if len(document_text) > 100_000:
         document_text = document_text[:100_000]
 
     answer = ask_gemini(
-        "Answer the user's question using the supplied document. "
-        "If the answer is not in the document, say so clearly.\n\n"
+        "Answer the user's question using only the supplied document. "
+        "If the answer is not in the document, say so clearly. "
+        "Be clear and concise.\n\n"
         f"DOCUMENT:\n{document_text}\n\n"
         f"QUESTION:\n{question}"
     )
