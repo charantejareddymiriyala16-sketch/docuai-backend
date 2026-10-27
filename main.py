@@ -60,6 +60,7 @@ def extract_text(filename: str, content: bytes) -> str:
 
 
 
+
 def ask_gemini(prompt: str) -> str:
     import logging
     import time
@@ -82,47 +83,38 @@ def ask_gemini(prompt: str) -> str:
     last_error = None
 
     for model in models:
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
+        try:
+            # Limit each request to 25 seconds.
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={"http_options": {"timeout": 25000}},
+            )
+
+            if not response.text:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gemini returned no text. Try another document.",
                 )
 
-                if not response.text:
-                    raise HTTPException(
-                        status_code=502,
-                        detail="Gemini returned no text. Try another document.",
-                    )
+            return response.text
 
-                return response.text
+        except HTTPException:
+            raise
 
-            except HTTPException:
-                raise
+        except Exception as exc:
+            last_error = exc
+            code = getattr(exc, "code", None)
 
-            except Exception as exc:
-                last_error = exc
-                code = getattr(exc, "code", None)
+            logging.warning(
+                "Gemini model %s failed with code %s: %s",
+                model,
+                code,
+                type(exc).__name__,
+            )
 
-                logging.warning(
-                    "Gemini model %s failed with code %s "
-                    "(attempt %s): %s",
-                    model,
-                    code,
-                    attempt + 1,
-                    type(exc).__name__,
-                )
-
-                # Retry temporary service or rate-limit errors once.
-                if code in (429, 500, 503) and attempt == 0:
-                    time.sleep(2)
-                    continue
-
-                # Try the fallback model for temporary errors.
-                if code in (429, 500, 503):
-                    break
-
-                # Do not retry invalid keys or other permanent errors.
+            # Try the fallback for temporary service errors.
+            if code not in (429, 500, 503):
                 raise HTTPException(
                     status_code=502,
                     detail=(
@@ -131,13 +123,16 @@ def ask_gemini(prompt: str) -> str:
                     ),
                 )
 
-    logging.error("All configured Gemini models failed: %s", last_error)
+            # Brief pause before attempting the fallback.
+            time.sleep(1)
+
+    logging.error("All Gemini models failed: %s", last_error)
 
     raise HTTPException(
         status_code=503,
         detail=(
-            "Gemini models are temporarily unavailable. "
-            "Please try again shortly."
+            "Gemini is temporarily unavailable. "
+            "Please try again in a minute."
         ),
     )
 
