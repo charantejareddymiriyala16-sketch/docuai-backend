@@ -174,7 +174,11 @@ async def summarize(file: UploadFile = File(...)):
         f"DOCUMENT:\n{text}"
     )
 
-    return {"filename": filename, "summary": summary}
+  return {
+    "filename": filename,
+    "summary": summary,
+    "document_text": text,
+}
 
 
 @app.post("/chat")
