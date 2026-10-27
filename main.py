@@ -58,7 +58,10 @@ def extract_text(filename: str, content: bytes) -> str:
     )
 
 
+
 def ask_gemini(prompt: str) -> str:
+    import logging
+
     if not client:
         raise HTTPException(
             status_code=500,
@@ -70,12 +73,25 @@ def ask_gemini(prompt: str) -> str:
             model=MODEL_NAME,
             contents=prompt,
         )
-        return response.text or "The AI returned an empty response."
-    except Exception:
+
+        if not response.text:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini returned no text. Try another document.",
+            )
+
+        return response.text
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logging.exception("Gemini request failed")
         raise HTTPException(
             status_code=502,
-            detail="Gemini could not process the request. Check the server logs and API limits.",
+            detail=f"Gemini request failed: {type(exc).__name__}. Check Render logs.",
         )
+
 
 
 @app.get("/")
