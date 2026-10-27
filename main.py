@@ -173,10 +173,10 @@ async def summarize(file: UploadFile = File(...)):
         "important points, and a conclusion. Do not invent facts.\n\n"
         f"DOCUMENT:\n{text}"
     )
-return {
-    "filename": filename,
-    "summary": summary,
-    "document_text": text,
+     return {
+          "filename": filename,
+        "summary": summary,
+        "document_text": text,
 }
 
 
