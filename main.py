@@ -114,7 +114,7 @@ def ask_gemini(prompt: str) -> str:
             )
 
             # Try the fallback for temporary service errors.
-            if code not in (429, 500, 503):
+            if code not in (429, 500, 503, 504):
                 raise HTTPException(
                     status_code=502,
                     detail=(
