@@ -2,18 +2,15 @@
 import os
 import io
 import logging
-import time
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
+from groq import Groq
 from pypdf import PdfReader
 from docx import Document
 
 app = FastAPI(title="DocuAI API")
 
-# Temporary development configuration.
-# Restrict this to your actual frontend origin before production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,10 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=API_KEY) if API_KEY else None
+API_KEY = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=API_KEY) if API_KEY else None
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
 def extract_text(filename: str, content: bytes) -> str:
@@ -53,11 +50,11 @@ def extract_text(filename: str, content: bytes) -> str:
         if name.endswith(".txt"):
             return content.decode("utf-8-sig", errors="replace")
 
-    except Exception as exc:
+    except Exception:
         logging.exception("Document extraction failed")
         raise HTTPException(
             status_code=400,
-            detail=f"Could not read this document: {exc}",
+            detail="Could not read this document. Check that the file is valid.",
         )
 
     raise HTTPException(
@@ -66,72 +63,59 @@ def extract_text(filename: str, content: bytes) -> str:
     )
 
 
-def ask_gemini(prompt: str) -> str:
+def ask_groq(prompt: str) -> str:
     if not client:
         raise HTTPException(
             status_code=500,
-            detail="Gemini API key is not configured on the server.",
+            detail="Groq API key is not configured on the server.",
         )
 
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.3,
+            max_completion_tokens=2048,
+        )
 
-    models = [MODEL_NAME]
-    if fallback_model and fallback_model not in models:
-        models.append(fallback_model)
+        answer = response.choices[0].message.content
 
-    last_error = None
-
-    for model in models:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config={"http_options": {"timeout": 25000}},
+        if not answer:
+            raise HTTPException(
+                status_code=502,
+                detail="Groq returned no text. Please try again.",
             )
 
-            if not response.text:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Gemini returned no text. Try again.",
-                )
+        return answer
 
-            return response.text
+    except HTTPException:
+        raise
 
-        except HTTPException:
-            raise
+    except Exception as exc:
+        logging.exception("Groq API request failed")
+        status_code = getattr(exc, "status_code", None)
 
-        except Exception as exc:
-            last_error = exc
-            code = getattr(exc, "code", None)
-
-            logging.warning(
-                "Gemini model %s failed with code %s: %s",
-                model,
-                code,
-                type(exc).__name__,
+        if status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Groq rate limit reached. Please wait and try again.",
             )
 
-            # Try another configured model for temporary errors.
-            if code not in (408, 429, 500, 502, 503, 504):
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Gemini request failed with code {code}. "
-                        "Check Render logs and API configuration."
-                    ),
-                )
+        if status_code in (401, 403):
+            raise HTTPException(
+                status_code=502,
+                detail="Groq API authentication failed. Check the server API key.",
+            )
 
-            time.sleep(1)
-
-    logging.error("All configured Gemini models failed: %s", last_error)
-
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "Gemini is temporarily unavailable. "
-            "Please try again shortly."
-        ),
-    )
+        raise HTTPException(
+            status_code=502,
+            detail="Groq request failed. Check the Render logs and model configuration.",
+        )
 
 
 @app.get("/")
@@ -169,13 +153,12 @@ async def summarize(file: UploadFile = File(...)):
     if len(text) > 100_000:
         text = text[:100_000]
 
-    summary = ask_gemini(
+    summary = ask_groq(
         "Summarize the following document clearly. Use a short overview, "
         "important points, and a conclusion. Do not invent facts.\n\n"
         f"DOCUMENT:\n{text}"
     )
 
-    # Return both the summary and extracted text for frontend Q&A.
     return {
         "filename": filename,
         "summary": summary,
@@ -206,7 +189,7 @@ async def chat(
     if len(document_text) > 100_000:
         document_text = document_text[:100_000]
 
-    answer = ask_gemini(
+    answer = ask_groq(
         "Answer the user's question using only the supplied document. "
         "If the answer is not in the document, say so clearly. "
         "Be clear and concise.\n\n"
